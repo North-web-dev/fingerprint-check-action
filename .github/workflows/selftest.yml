@@ -1,0 +1,76 @@
+name: selftest
+
+# Proves the action works end-to-end against the LIVE reflector on every push/PR.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so reflector/DB drift surfaces even without a push.
+    - cron: "17 4 * * 1"
+
+jobs:
+  curl-is-not-a-browser:
+    # The runner's plain curl must NOT look like Chrome. We assert the chrome
+    # profile with fail-on-mismatch:false and then verify match == false.
+    # This exercises: reflector fetch, fingerprint-db profile lookup, JA4 compare.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check curl against the chrome profile (expect NO match)
+        id: fp
+        uses: ./
+        with:
+          expect-profile: chrome
+          fields: ja4
+          fail-on-mismatch: false
+
+      - name: Assert the negative outcome
+        shell: bash
+        env:
+          MATCH: ${{ steps.fp.outputs.match }}
+          JA4: ${{ steps.fp.outputs.ja4 }}
+          UA: ${{ steps.fp.outputs.user-agent }}
+        run: |
+          echo "observed ja4=$JA4  ua=$UA  match=$MATCH"
+          [ -n "$JA4" ] || { echo "::error::action produced no ja4 output"; exit 1; }
+          if [ "$MATCH" != "false" ]; then
+            echo "::error::expected curl NOT to match chrome, but match=$MATCH"
+            exit 1
+          fi
+          echo "OK: curl correctly does not look like Chrome."
+
+  self-match:
+    # Positive path: capture the reflector's own view, then assert the action
+    # matches that exact JA4. Proves a true match returns match==true and exit 0.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture this runner's JA4 from the reflector
+        id: cap
+        shell: bash
+        run: |
+          JA4="$(curl -fsSL --max-time 30 https://fp.shshbshsnang.shop/api/all | jq -r .ja4)"
+          echo "ja4=$JA4" >> "$GITHUB_OUTPUT"
+          echo "captured ja4=$JA4"
+
+      - name: Assert the action matches the captured JA4 (expect match)
+        id: fp
+        uses: ./
+        with:
+          run: curl -sS "$FP_REFLECTOR"
+          expect-ja4: ${{ steps.cap.outputs.ja4 }}
+          fields: ja4
+          fail-on-mismatch: true
+
+      - name: Assert match==true
+        shell: bash
+        env:
+          MATCH: ${{ steps.fp.outputs.match }}
+        run: |
+          echo "match=$MATCH"
+          [ "$MATCH" = "true" ] || { echo "::error::expected a positive match"; exit 1; }
+          echo "OK: action reports a true match and passes."

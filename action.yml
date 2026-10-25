@@ -1,0 +1,101 @@
+name: "Fingerprint Check"
+description: "Catch TLS-fingerprint regressions in CI — assert your HTTP client still looks like a real browser (JA3/JA4/Akamai HTTP2)."
+author: "North-web-dev"
+
+branding:
+  icon: "shield"
+  color: "green"
+
+inputs:
+  reflector:
+    description: >-
+      Fingerprint reflector URL that echoes back the JA3/JA4/JA4H/Akamai-h2 it
+      observed, as JSON. Defaults to the public live reflector.
+    required: false
+    default: "https://fp.shshbshsnang.shop/api/all"
+  run:
+    description: >-
+      Optional shell command that makes YOUR client hit the reflector and prints
+      the reflector's JSON response to stdout. The reflector URL is exported as
+      $FP_REFLECTOR for the command to use. When empty, the action fetches the
+      reflector itself with plain curl (which is NOT a browser — useful as a
+      negative/self-test).
+    required: false
+    default: ""
+  expect-profile:
+    description: >-
+      Name of a known browser profile (e.g. chrome, edge, firefox, safari, ios)
+      whose expected JA4 / JA3-hash / Akamai-h2 are looked up live from
+      fingerprint-db. Mutually exclusive with expect-ja4 for the ja4 field.
+    required: false
+    default: ""
+  expect-ja4:
+    description: >-
+      Explicit target JA4 string to match (overrides expect-profile for the ja4
+      field). JA4 drifts with browser versions — re-pin it periodically.
+    required: false
+    default: ""
+  expect-ja3-hash:
+    description: >-
+      Explicit target JA3 hash. NOTE: Chrome/Edge JA3 is non-deterministic
+      (GREASE) — prefer asserting ja4. Only used when 'fields' includes ja3_hash.
+    required: false
+    default: ""
+  expect-akamai-h2:
+    description: >-
+      Explicit target Akamai HTTP/2 fingerprint. Only used when 'fields' includes
+      akamai_h2.
+    required: false
+    default: ""
+  fields:
+    description: >-
+      Comma-separated fingerprint fields to assert. Any of: ja4, ja3_hash,
+      akamai_h2. Default: ja4 (the stable, recommended assertion).
+    required: false
+    default: "ja4"
+  fail-on-mismatch:
+    description: "Fail the build when the observed fingerprint does not match the expected one."
+    required: false
+    default: "true"
+  profiles-url:
+    description: >-
+      URL of the fingerprint-db fingerprints.json used to resolve expect-profile.
+      Defaults to the main branch of North-web-dev/fingerprint-db so values are
+      never hardcoded/stale.
+    required: false
+    default: "https://raw.githubusercontent.com/North-web-dev/fingerprint-db/main/fingerprints.json"
+
+outputs:
+  ja4:
+    description: "The JA4 the reflector observed from the client."
+    value: ${{ steps.check.outputs.ja4 }}
+  ja3-hash:
+    description: "The JA3 hash the reflector observed."
+    value: ${{ steps.check.outputs.ja3_hash }}
+  akamai-h2:
+    description: "The Akamai HTTP/2 fingerprint the reflector observed."
+    value: ${{ steps.check.outputs.akamai_h2 }}
+  user-agent:
+    description: "The User-Agent the reflector observed."
+    value: ${{ steps.check.outputs.user_agent }}
+  match:
+    description: "'true' when all asserted fields matched the expected profile, else 'false'."
+    value: ${{ steps.check.outputs.match }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: check
+      shell: bash
+      env:
+        FP_REFLECTOR: ${{ inputs.reflector }}
+        INPUT_REFLECTOR: ${{ inputs.reflector }}
+        INPUT_RUN: ${{ inputs.run }}
+        INPUT_EXPECT_PROFILE: ${{ inputs.expect-profile }}
+        INPUT_EXPECT_JA4: ${{ inputs.expect-ja4 }}
+        INPUT_EXPECT_JA3_HASH: ${{ inputs.expect-ja3-hash }}
+        INPUT_EXPECT_AKAMAI_H2: ${{ inputs.expect-akamai-h2 }}
+        INPUT_FIELDS: ${{ inputs.fields }}
+        INPUT_FAIL_ON_MISMATCH: ${{ inputs.fail-on-mismatch }}
+        INPUT_PROFILES_URL: ${{ inputs.profiles-url }}
+      run: ${{ github.action_path }}/fingerprint-check.sh
