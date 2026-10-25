@@ -13,6 +13,8 @@ set -euo pipefail
 # ---- tiny helpers ----------------------------------------------------------
 die()  { printf '::error::%s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
+# untrusted values (reflector/run stdout, fetched DB): drop CR/LF and leading ':' to block GITHUB_OUTPUT / workflow-command injection
+scrub() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^:*//'; }
 group_start() { printf '::group::%s\n' "$*"; }
 group_end()   { printf '::endgroup::\n'; }
 
@@ -97,6 +99,8 @@ OBS_JA3_HASH="$(printf '%s' "$RAW" | jq -r '.ja3_hash // ""')"
 # reflector calls it akamai_h2; accept a couple of aliases defensively.
 OBS_AKAMAI="$(printf '%s' "$RAW"   | jq -r '.akamai_h2 // .akamai // .akamai_fingerprint // ""')"
 OBS_UA="$(printf '%s' "$RAW"       | jq -r '.user_agent // .["user-agent"] // ""')"
+OBS_JA4="$(scrub "$OBS_JA4")"; OBS_JA3_HASH="$(scrub "$OBS_JA3_HASH")"
+OBS_AKAMAI="$(scrub "$OBS_AKAMAI")"; OBS_UA="$(scrub "$OBS_UA")"
 
 note "observed ja4       : ${OBS_JA4:-<none>}"
 note "observed ja3_hash  : ${OBS_JA3_HASH:-<none>}"
@@ -114,6 +118,7 @@ if [ -n "$EXPECT_PROFILE" ]; then
   DB_JA4="$(printf '%s' "$DB"      | jq -r --arg p "$EXPECT_PROFILE" '.browsers[$p].tls.ja4 // ""')"
   DB_JA3_HASH="$(printf '%s' "$DB" | jq -r --arg p "$EXPECT_PROFILE" '.browsers[$p].tls.ja3_hash // ""')"
   DB_AKAMAI="$(printf '%s' "$DB"   | jq -r --arg p "$EXPECT_PROFILE" '.browsers[$p].http2.akamai_fingerprint // ""')"
+  DB_JA4="$(scrub "$DB_JA4")"; DB_JA3_HASH="$(scrub "$DB_JA3_HASH")"; DB_AKAMAI="$(scrub "$DB_AKAMAI")"
   note "profile ja4      : $DB_JA4"
   note "profile ja3_hash : $DB_JA3_HASH"
   note "profile akamai   : $DB_AKAMAI"
