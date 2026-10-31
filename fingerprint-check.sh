@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
-#
-# fingerprint-check.sh — core of the fingerprint-check-action.
-#
-# Reads the fingerprint a reflector observed from an HTTP client (either the
-# client driven by the user-supplied `run` command, or plain curl) and asserts
-# that it still matches an expected browser profile. Exits non-zero on mismatch
-# when fail-on-mismatch is true.
-#
-# Depends only on bash, curl and jq — all preinstalled on GitHub-hosted runners.
+# Core of fingerprint-check-action. Needs bash, curl, jq (python3 optional).
 set -euo pipefail
 
-# ---- tiny helpers ----------------------------------------------------------
 die()  { printf '::error::%s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
-# untrusted values (reflector/run stdout, fetched DB): drop CR/LF and leading ':' to block GITHUB_OUTPUT / workflow-command injection
-scrub() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^:*//'; }
 group_start() { printf '::group::%s\n' "$*"; }
 group_end()   { printf '::endgroup::\n'; }
+
+# Untrusted values (reflector/run stdout, fetched DB) reach logs and
+# $GITHUB_OUTPUT: strip control chars + leading ':' so they cannot inject
+# extra output lines or ::workflow-commands::.
+sanitize() { printf '%s' "$1" | tr -d '\000-\037' | sed -e 's/^:\{1,\}//'; }
+
+# Write key=value to $GITHUB_OUTPUT, blanking (with a warning) a value that
+# fails its allowed single-line pattern. Defence-in-depth over sanitize.
+emit() {
+  local key="$1" val="$2" re="$3"
+  if [ -n "$val" ] && ! printf '%s' "$val" | grep -Eq "$re"; then
+    printf '::warning::output %s dropped: value failed validation\n' "$key"
+    val=""
+  fi
+  printf '%s=%s\n' "$key" "$val" >> "$GITHUB_OUTPUT"
+}
 
 command -v jq   >/dev/null 2>&1 || die "jq is required but not found on the runner."
 command -v curl >/dev/null 2>&1 || die "curl is required but not found on the runner."
@@ -31,7 +36,6 @@ FIELDS="${INPUT_FIELDS:-ja4}"
 FAIL_ON_MISMATCH="${INPUT_FAIL_ON_MISMATCH:-true}"
 PROFILES_URL="${INPUT_PROFILES_URL:-}"
 
-# Normalise the fields list -> space separated, lowercased, de-whitespaced.
 FIELDS_NORM="$(printf '%s' "$FIELDS" | tr 'A-Z,' 'a-z ' | tr -s ' ' | sed 's/^ //;s/ $//')"
 [ -n "$FIELDS_NORM" ] || FIELDS_NORM="ja4"
 for f in $FIELDS_NORM; do
@@ -41,30 +45,19 @@ for f in $FIELDS_NORM; do
   esac
 done
 
-# ---- 1. obtain the observed fingerprint JSON -------------------------------
 group_start "Observe fingerprint"
 RAW=""
 if [ -n "$RUN_CMD" ]; then
   note "Running user command to reach the reflector:"
   note "  $RUN_CMD"
-  # Export reflector so the command can reference $FP_REFLECTOR.
   export FP_REFLECTOR="$REFLECTOR"
-  if ! RAW="$(bash -c "$RUN_CMD")"; then
-    group_end
-    die "The 'run' command exited non-zero."
-  fi
+  RAW="$(bash -c "$RUN_CMD")" || { group_end; die "The 'run' command exited non-zero."; }
 else
-  note "No 'run' command given — fetching the reflector with plain curl."
-  note "  (curl is NOT a browser, so expect a mismatch when asserting a browser profile.)"
-  if ! RAW="$(curl -fsSL --max-time 30 "$REFLECTOR")"; then
-    group_end
-    die "curl could not reach the reflector: $REFLECTOR"
-  fi
+  note "No 'run' command given — fetching the reflector with plain curl (curl is not a browser)."
+  RAW="$(curl -fsSL --max-time 30 "$REFLECTOR")" || { group_end; die "curl could not reach the reflector: $REFLECTOR"; }
 fi
 
-# The command/curl is expected to print the reflector's JSON. Be lenient: if the
-# whole stdout isn't valid JSON, try to carve out the first balanced JSON object
-# (handles a command that also prints its own log lines around the response).
+# Tolerate a command that prints log lines around the JSON: carve the first object.
 if ! printf '%s' "$RAW" | jq -e . >/dev/null 2>&1; then
   EXTRACT=""
   if command -v python3 >/dev/null 2>&1; then
@@ -76,8 +69,7 @@ i = s.find("{")
 while i != -1:
     try:
         obj, _ = dec.raw_decode(s, i)
-        sys.stdout.write(json.dumps(obj))
-        break
+        sys.stdout.write(json.dumps(obj)); break
     except ValueError:
         i = s.find("{", i + 1)
 ' 2>/dev/null || true)"
@@ -90,17 +82,15 @@ while i != -1:
     note ""
     note "--------------------------------------------"
     group_end
-    die "Could not parse a JSON fingerprint from the output. The command must print the reflector's JSON response to stdout."
+    die "Could not parse a JSON fingerprint from the output. The command must print the reflector's JSON to stdout."
   fi
 fi
 
-OBS_JA4="$(printf '%s' "$RAW"      | jq -r '.ja4 // ""')"
-OBS_JA3_HASH="$(printf '%s' "$RAW" | jq -r '.ja3_hash // ""')"
-# reflector calls it akamai_h2; accept a couple of aliases defensively.
-OBS_AKAMAI="$(printf '%s' "$RAW"   | jq -r '.akamai_h2 // .akamai // .akamai_fingerprint // ""')"
-OBS_UA="$(printf '%s' "$RAW"       | jq -r '.user_agent // .["user-agent"] // ""')"
-OBS_JA4="$(scrub "$OBS_JA4")"; OBS_JA3_HASH="$(scrub "$OBS_JA3_HASH")"
-OBS_AKAMAI="$(scrub "$OBS_AKAMAI")"; OBS_UA="$(scrub "$OBS_UA")"
+OBS_JA4="$(sanitize "$(printf '%s' "$RAW"      | jq -r '.ja4 // ""')")"
+OBS_JA3_HASH="$(sanitize "$(printf '%s' "$RAW" | jq -r '.ja3_hash // ""')")"
+# reflector field is akamai_h2; accept aliases defensively.
+OBS_AKAMAI="$(sanitize "$(printf '%s' "$RAW"   | jq -r '.akamai_h2 // .akamai // .akamai_fingerprint // ""')")"
+OBS_UA="$(sanitize "$(printf '%s' "$RAW"       | jq -r '.user_agent // .["user-agent"] // ""')")"
 
 note "observed ja4       : ${OBS_JA4:-<none>}"
 note "observed ja3_hash  : ${OBS_JA3_HASH:-<none>}"
@@ -108,17 +98,15 @@ note "observed akamai_h2 : ${OBS_AKAMAI:-<none>}"
 note "observed user-agent: ${OBS_UA:-<none>}"
 group_end
 
-# ---- 2. resolve expected values --------------------------------------------
 group_start "Resolve expected profile"
 if [ -n "$EXPECT_PROFILE" ]; then
   note "Resolving profile '$EXPECT_PROFILE' from: $PROFILES_URL"
   DB="$(curl -fsSL --max-time 30 "$PROFILES_URL")" || die "Could not fetch profiles DB: $PROFILES_URL"
   printf '%s' "$DB" | jq -e --arg p "$EXPECT_PROFILE" '.browsers[$p]' >/dev/null 2>&1 \
     || die "Profile '$EXPECT_PROFILE' not found in the DB. Available: $(printf '%s' "$DB" | jq -r '.browsers | keys | join(", ")')"
-  DB_JA4="$(printf '%s' "$DB"      | jq -r --arg p "$EXPECT_PROFILE" '.browsers[$p].tls.ja4 // ""')"
-  DB_JA3_HASH="$(printf '%s' "$DB" | jq -r --arg p "$EXPECT_PROFILE" '.browsers[$p].tls.ja3_hash // ""')"
-  DB_AKAMAI="$(printf '%s' "$DB"   | jq -r --arg p "$EXPECT_PROFILE" '.browsers[$p].http2.akamai_fingerprint // ""')"
-  DB_JA4="$(scrub "$DB_JA4")"; DB_JA3_HASH="$(scrub "$DB_JA3_HASH")"; DB_AKAMAI="$(scrub "$DB_AKAMAI")"
+  DB_JA4="$(sanitize "$(printf '%s' "$DB"      | jq -r --arg p "$EXPECT_PROFILE" '.browsers[$p].tls.ja4 // ""')")"
+  DB_JA3_HASH="$(sanitize "$(printf '%s' "$DB" | jq -r --arg p "$EXPECT_PROFILE" '.browsers[$p].tls.ja3_hash // ""')")"
+  DB_AKAMAI="$(sanitize "$(printf '%s' "$DB"   | jq -r --arg p "$EXPECT_PROFILE" '.browsers[$p].http2.akamai_fingerprint // ""')")"
   note "profile ja4      : $DB_JA4"
   note "profile ja3_hash : $DB_JA3_HASH"
   note "profile akamai   : $DB_AKAMAI"
@@ -132,7 +120,6 @@ EXP_JA3_HASH="${EXPECT_JA3_HASH:-$DB_JA3_HASH}"
 EXP_AKAMAI="${EXPECT_AKAMAI_H2:-$DB_AKAMAI}"
 group_end
 
-# ---- 3. compare ------------------------------------------------------------
 group_start "Assert fields: $FIELDS_NORM"
 MATCH="true"
 SUMMARY=""
@@ -164,14 +151,13 @@ for f in $FIELDS_NORM; do
 done
 group_end
 
-# ---- 4. outputs + job summary ----------------------------------------------
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  emit ja4      "$OBS_JA4"      '^[A-Za-z0-9._-]{1,128}$'
+  emit ja3_hash "$OBS_JA3_HASH" '^[0-9a-fA-F]{32,64}$'
   {
-    echo "ja4=$OBS_JA4"
-    echo "ja3_hash=$OBS_JA3_HASH"
-    echo "akamai_h2=$OBS_AKAMAI"
-    echo "user_agent=$OBS_UA"
-    echo "match=$MATCH"
+    printf 'akamai_h2=%s\n'  "$OBS_AKAMAI"
+    printf 'user_agent=%s\n' "$OBS_UA"
+    printf 'match=%s\n'      "$MATCH"
   } >> "$GITHUB_OUTPUT"
 fi
 
@@ -189,7 +175,6 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   } >> "$GITHUB_STEP_SUMMARY"
 fi
 
-# ---- 5. exit ---------------------------------------------------------------
 if [ "$MATCH" = "true" ]; then
   note "Result: MATCH ✅"
   exit 0
